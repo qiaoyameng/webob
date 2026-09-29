@@ -1055,6 +1055,54 @@ class BaseRequest:
 
         return tempfile.TemporaryFile()
 
+    def body_replay_view(self):
+        """
+        Return a new, independent replay view over the request body.
+
+        Each view is a file-like object (supporting ``read``, ``readline``,
+        ``seek``, ``tell`` and ``close``) with its own cursor, so multiple
+        consumers (for example an auditing middleware and a form parser)
+        can read the body independently without sharing a cursor.
+
+        All views handed out by a request share a single
+        :class:`BodyReplayStore`, which consumes the original
+        ``wsgi.input`` at most once, buffering the body in memory and
+        spilling to a temporary file once it grows past
+        ``self.request_body_tempfile_limit``. The storage is released when
+        the last open view is closed; closing one view never affects the
+        others.
+
+        A body without a ``CONTENT_LENGTH`` can only be replayed when the
+        server declares that the input is terminated
+        (``wsgi.input_terminated``), otherwise there is no way to know
+        where the body ends and a ``ValueError`` is raised.
+        """
+
+        env = self.environ
+        store, raw = env.get("webob.body_replay_store", (None, None))
+
+        if raw is not self.body_file_raw:
+            store = None
+
+        if store is None:
+            if self.content_length is None and not self.is_body_readable:
+                raise ValueError(
+                    "Cannot create a body replay view: the request body has "
+                    "no CONTENT_LENGTH and the server did not declare "
+                    "wsgi.input_terminated, so the end of the body cannot "
+                    "be determined."
+                )
+            store = BodyReplayStore(
+                self.body_file_raw,
+                content_length=self.content_length,
+                terminated=True,
+                tempfile_limit=self.request_body_tempfile_limit,
+                tempfile_factory=self.make_tempfile,
+            )
+            env["webob.body_replay_store"] = store, self.body_file_raw
+
+        return store.open_view()
+
     def remove_conditional_headers(
         self,
         remove_encoding=True,
@@ -1644,6 +1692,264 @@ class LimitedLengthFile(io.RawIOBase):
         buff[:sz] = data
 
         return sz
+
+
+class BodyReplayStore:
+    """
+    Single-pass shared storage backing one or more body replay views.
+
+    The source stream is consumed at most once, lazily, as the views
+    demand more data. Buffered content is kept in memory until it grows
+    past ``tempfile_limit`` bytes, after which it spills into a temporary
+    file created by ``tempfile_factory``.
+
+    If ``content_length`` is not given, the body is read until EOF, which
+    is only allowed when ``terminated`` is true (i.e. the server declared
+    ``wsgi.input_terminated``); otherwise a ``ValueError`` is raised.
+
+    The storage is reference counted through its views: it is released
+    when the last open view is closed.
+    """
+
+    def __init__(
+        self,
+        stream,
+        content_length=None,
+        terminated=False,
+        tempfile_limit=10 * 1024,
+        tempfile_factory=None,
+    ):
+        if content_length is None and not terminated:
+            raise ValueError(
+                "Cannot replay a body of unknown length unless the server "
+                "declares that the input is terminated "
+                "(wsgi.input_terminated)."
+            )
+        self._stream = stream
+        self._remaining = content_length
+        self._tempfile_limit = tempfile_limit
+        self._tempfile_factory = tempfile_factory or tempfile.TemporaryFile
+        self._file = io.BytesIO()
+        self._spilled = False
+        self._buffered = 0
+        self._exhausted = content_length == 0
+        self._length = content_length
+        self._refs = 0
+        self._released = False
+
+    @property
+    def released(self):
+        return self._released
+
+    def open_view(self):
+        if self._released:
+            raise ValueError("The body replay storage has been released.")
+        self._refs += 1
+
+        return BodyReplayView(self)
+
+    def _release(self):
+        self._refs -= 1
+
+        if self._refs <= 0:
+            self._refs = 0
+            self._released = True
+            self._file.close()
+
+    def _pull_chunk(self):
+        remaining = self._remaining
+
+        if remaining is not None:
+            if remaining <= 0:
+                self._exhausted = True
+
+                return
+            want = min(remaining, 65536)
+        else:
+            want = 65536
+
+        data = self._stream.read(want)
+
+        if not data:
+            if remaining:
+                raise DisconnectionError(
+                    "The client disconnected while sending the body "
+                    "(%d more bytes were expected)" % (remaining,)
+                )
+            self._exhausted = True
+            self._length = self._buffered
+
+            return
+
+        if remaining is not None:
+            if len(data) > remaining:
+                data = data[:remaining]
+            self._remaining = remaining - len(data)
+
+            if self._remaining == 0:
+                self._exhausted = True
+
+        self._append(data)
+
+    def _append(self, data):
+        if (
+            not self._spilled
+            and self._buffered + len(data) > self._tempfile_limit
+        ):
+            fileobj = self._tempfile_factory()
+            self._file.seek(0)
+            fileobj.write(self._file.read())
+            self._file.close()
+            self._file = fileobj
+            self._spilled = True
+
+        self._file.seek(self._buffered)
+        self._file.write(data)
+        self._buffered += len(data)
+
+    def _fill_to(self, end):
+        while not self._exhausted and self._buffered < end:
+            self._pull_chunk()
+
+    def _fill_all(self):
+        while not self._exhausted:
+            self._pull_chunk()
+
+    def end_length(self):
+        """
+        The total length of the body, draining the source stream first
+        if the length is not known yet.
+        """
+
+        self._fill_all()
+
+        return self._length
+
+    def clamp_position(self, pos):
+        """
+        Clamp a cursor position to the body bounds, pulling in as much
+        of the source stream as needed to validate the position.
+        """
+
+        if pos <= 0:
+            return 0
+        self._fill_to(pos)
+
+        return min(pos, self._buffered)
+
+    def read_at(self, pos, size=-1):
+        if size is None or size < 0:
+            self._fill_all()
+            end = self._length
+        else:
+            self._fill_to(pos + size)
+            end = min(pos + size, self._buffered)
+
+        if end <= pos:
+            return b""
+        self._file.seek(pos)
+
+        return self._file.read(end - pos)
+
+    def readline_at(self, pos, size=-1):
+        scan = pos
+
+        while True:
+            if size is None or size < 0:
+                window = self._buffered
+            else:
+                window = min(self._buffered, pos + size)
+            self._file.seek(scan)
+            idx = self._file.read(window - scan).find(b"\n")
+
+            if idx != -1:
+                end = scan + idx + 1
+
+                break
+            scan = window
+
+            if size is not None and size >= 0 and self._buffered - pos >= size:
+                end = pos + size
+
+                break
+
+            if self._exhausted:
+                end = self._buffered
+
+                break
+            self._pull_chunk()
+
+        if end <= pos:
+            return b""
+        self._file.seek(pos)
+
+        return self._file.read(end - pos)
+
+
+class BodyReplayView(io.IOBase):
+    """
+    An independent cursor over a shared :class:`BodyReplayStore`.
+
+    Supports ``read``, ``readline``, ``seek``, ``tell`` and ``close``.
+    The cursor is always kept within the body bounds so that ``seek``,
+    ``read`` and ``readline`` agree on where the body ends. Closing a
+    view only detaches this cursor; the shared storage is released when
+    the last open view is closed.
+    """
+
+    def __init__(self, store):
+        self._store = store
+        self._pos = 0
+
+    def _check_open(self):
+        if self.closed:
+            raise ValueError("I/O operation on a closed body replay view.")
+
+    @staticmethod
+    def readable():
+        return True
+
+    @staticmethod
+    def seekable():
+        return True
+
+    def tell(self):
+        return self._pos
+
+    def read(self, size=-1):
+        self._check_open()
+        data = self._store.read_at(self._pos, size)
+        self._pos += len(data)
+
+        return data
+
+    def readline(self, size=-1):
+        self._check_open()
+        data = self._store.readline_at(self._pos, size)
+        self._pos += len(data)
+
+        return data
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        self._check_open()
+
+        if whence == io.SEEK_SET:
+            new_pos = offset
+        elif whence == io.SEEK_CUR:
+            new_pos = self._pos + offset
+        elif whence == io.SEEK_END:
+            new_pos = self._store.end_length() + offset
+        else:
+            raise ValueError("Invalid whence: %r" % (whence,))
+
+        self._pos = self._store.clamp_position(new_pos)
+
+        return self._pos
+
+    def close(self):
+        if not self.closed:
+            self._store._release()
+        super().close()
 
 
 def _get_multipart_boundary(ctype):
