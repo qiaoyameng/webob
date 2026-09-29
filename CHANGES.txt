@@ -1,6 +1,18 @@
 Unreleased
 ----------
 
+Feature
+~~~~~~~
+
+- Add typed access to HTTP Structured Fields (RFC 8941): the new
+  ``webob.structured`` module parses and serializes ``item``, ``list``
+  and ``dictionary`` fields, and ``ResponseHeaders``/``EnvironHeaders``
+  gain ``get_structured()``/``set_structured()`` methods.  Repeated
+  header lines are merged according to the declared field type, and
+  invalid input (out-of-range numbers, bad escapes, duplicate
+  dictionary members) raises ``StructuredFieldError``.
+
+
 Security Fix
 ~~~~~~~~~~~~
 

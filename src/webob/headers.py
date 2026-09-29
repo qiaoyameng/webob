@@ -1,5 +1,6 @@
 from collections.abc import MutableMapping
 
+from webob import structured
 from webob.multidict import MultiDict
 
 __all__ = ["ResponseHeaders", "EnvironHeaders"]
@@ -80,6 +81,34 @@ class ResponseHeaders(MultiDict):
 
         return default
 
+    def get_structured(self, key, field_type):
+        """Return this header parsed as an HTTP Structured Field.
+
+        ``field_type`` is one of ``"item"``, ``"list"`` or
+        ``"dictionary"`` (see :mod:`webob.structured`).  Repeated
+        header lines are combined according to the field type: lists
+        and dictionaries are merged, while an item field must appear
+        exactly once.  Raises :exc:`KeyError` if the header is absent
+        and :exc:`~webob.structured.StructuredFieldError` if the value
+        is not valid for the declared type.
+        """
+        values = self.getall(key)
+
+        if not values:
+            raise KeyError(key)
+
+        return structured.parse_field(values, field_type)
+
+    def set_structured(self, key, value, field_type=None):
+        """Serialize ``value`` as an HTTP Structured Field header.
+
+        This replaces any existing lines for the header with a single
+        line in canonical form.  ``field_type`` defaults to being
+        inferred from ``value`` (see
+        :func:`webob.structured.serialize_field`).
+        """
+        self[key] = structured.serialize_field(value, field_type)
+
     def pop(self, key, *args):
         if len(args) > 1:
             raise TypeError(
@@ -152,6 +181,25 @@ class EnvironHeaders(MutableMapping):
 
     def __delitem__(self, hname):
         del self.environ[_trans_name(hname)]
+
+    def get_structured(self, hname, field_type):
+        """Return this header parsed as an HTTP Structured Field.
+
+        ``field_type`` is one of ``"item"``, ``"list"`` or
+        ``"dictionary"`` (see :mod:`webob.structured`).  Raises
+        :exc:`KeyError` if the header is absent and
+        :exc:`~webob.structured.StructuredFieldError` if the value is
+        not valid for the declared type.
+        """
+        return structured.parse_field(self[hname], field_type)
+
+    def set_structured(self, hname, value, field_type=None):
+        """Serialize ``value`` as an HTTP Structured Field header.
+
+        ``field_type`` defaults to being inferred from ``value`` (see
+        :func:`webob.structured.serialize_field`).
+        """
+        self[hname] = structured.serialize_field(value, field_type)
 
     def keys(self):
         return filter(None, map(_trans_key, self.environ))
