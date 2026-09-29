@@ -4428,6 +4428,188 @@ class TestAcceptLanguage:
         assert list_of_returned == expected_list
 
 
+class TestAcceptLanguageExtendedFiltering:
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "",
+            "*s",
+            "a-**",
+            "a" * 9,
+            "a-" + "a" * 9,
+            "-",
+            "a-",
+            "-a",
+            "en_gb",
+            "en/gb",
+            "foo, bar, baz;q= 0.001",
+        ],
+    )
+    def test_parse_extended__invalid(self, value):
+        with pytest.raises(ValueError):
+            AcceptLanguage.parse_extended(value=value)
+
+    @pytest.mark.parametrize(
+        "value, expected_list",
+        [
+            ("*", [("*", 1.0)]),
+            ("de", [("de", 1.0)]),
+            ("de-DE", [("de-DE", 1.0)]),
+            # Extended language ranges: any subtag may be the wildcard '*'
+            ("de-*-DE", [("de-*-DE", 1.0)]),
+            ("*-DE", [("*-DE", 1.0)]),
+            ("de-*-DE;q=0.9, de;q=0.5", [("de-*-DE", 0.9), ("de", 0.5)]),
+            ("de-x-goethe, de-*-x-*", [("de-x-goethe", 1.0), ("de-*-x-*", 1.0)]),
+        ],
+    )
+    def test_parse_extended__valid(self, value, expected_list):
+        returned = AcceptLanguage.parse_extended(value=value)
+        list_of_returned = list(returned)
+        assert list_of_returned == expected_list
+
+    @pytest.mark.parametrize(
+        "language_ranges, language_tags, expected_returned",
+        [
+            # Empty `language_tags`
+            ("de-*-DE", [], []),
+            # No matches
+            ("de-*-DE", ["fr", "en-GB"], []),
+            # A wildcard subtag matches any single subtag...
+            ("de-*-DE", ["de-Latn-DE"], [("de-Latn-DE", 1.0)]),
+            # ...or no subtag at all
+            ("de-*-DE", ["de-DE"], [("de-DE", 1.0)]),
+            # ...or, with skipping, a sequence of non-singleton subtags
+            (
+                "de-*-DE",
+                ["de-Latn-Bavaria-DE"],
+                [("de-Latn-Bavaria-DE", 1.0)],
+            ),
+            # Extra subtags at the end of the tag are fine
+            ("de-*-DE", ["de-DE-x-goethe"], [("de-DE-x-goethe", 1.0)]),
+            # A singleton (single letter/digit) subtag in the tag, such as
+            # the 'x' of a private-use extension, cannot be skipped over
+            ("de-*-DE", ["de-x-DE"], []),
+            ("de-*-DE", ["de-Latn-x-DE"], []),
+            # ...but a singleton in the tag can be matched explicitly
+            ("de-*-x-*-goethe", ["de-Latn-x-goethe"], [("de-Latn-x-goethe", 1.0)]),
+            # Matching is case-insensitive, and the original tag is returned
+            ("DE-*-dE", ["de-Latn-DE"], [("de-Latn-DE", 1.0)]),
+            ("de-*-de", ["DE-LATN-DE"], [("DE-LATN-DE", 1.0)]),
+            # A wildcard as the first subtag of the range
+            ("*-DE", ["de-DE", "en-DE"], [("de-DE", 1.0), ("en-DE", 1.0)]),
+            # The de-DE / de-Latn-DE / de-DE-x-goethe candidates
+            (
+                "de-*-DE;q=0.9, de;q=0.5",
+                ["de-DE", "de-Latn-DE", "de-DE-x-goethe"],
+                [("de-DE", 0.9), ("de-Latn-DE", 0.9), ("de-DE-x-goethe", 0.9)],
+            ),
+            # A tag matching a non-'*' range with q=0 is filtered out, even
+            # if it also matches another range with a non-0 qvalue
+            ("de-DE, de-*-DE;q=0", ["de-DE", "de-Latn-DE", "de-DE-x-goethe"], []),
+            # Overlapping q=0 ranges each exclude exactly what they match
+            (
+                "de-*-DE, de-Latn-DE;q=0, de-DE-x-goethe;q=0",
+                ["de-DE", "de-Latn-DE", "de-DE-x-goethe"],
+                [("de-DE", 1.0)],
+            ),
+            (
+                "de-Latn-DE;q=0, de-*-DE;q=0.7",
+                ["de-DE", "de-Latn-DE", "de-DE-x-goethe"],
+                [("de-DE", 0.7), ("de-DE-x-goethe", 0.7)],
+            ),
+            # '*', when it is the only range, matches everything
+            ("*", ["de", "fr"], [("de", 1.0), ("fr", 1.0)]),
+            # '*' matches only tags not matched by any other range
+            (
+                "de-DE, *;q=0.2",
+                ["de-DE", "fr"],
+                [("de-DE", 1.0), ("fr", 0.2)],
+            ),
+            # '*;q=0' filters out tags not matched by any other range
+            ("de-DE, *;q=0", ["de-DE", "fr"], [("de-DE", 1.0)]),
+            # More than one range matching the same tag: range with the
+            # highest qvalue is matched
+            (
+                "de-*-DE;q=0.7, de-DE;q=0.9",
+                ["de-DE"],
+                [("de-DE", 0.9)],
+            ),
+            # Same qvalue: the more specific range is matched
+            (
+                "de;q=0.8, de-*-DE;q=0.8",
+                ["de-DE"],
+                [("de-DE", 0.8)],
+            ),
+            # The returned list is sorted in descending order of qvalue
+            (
+                "de-*-DE;q=0.9, fr;q=0.5",
+                ["fr", "de-DE"],
+                [("de-DE", 0.9), ("fr", 0.5)],
+            ),
+            # Same qvalue: the tag whose matched range is more specific
+            # comes first
+            (
+                "de-*-DE;q=0.8, fr;q=0.8",
+                ["fr", "de-DE"],
+                [("de-DE", 0.8), ("fr", 0.8)],
+            ),
+            # The server's preference (order of `language_tags`) only breaks
+            # ties when qvalue and specificity are the same
+            (
+                "de-DE;q=0.8, de-*-DE;q=0.8",
+                ["de-DE-x-goethe", "de-DE"],
+                [("de-DE-x-goethe", 0.8), ("de-DE", 0.8)],
+            ),
+            (
+                "de-DE;q=0.8, de-*-DE;q=0.8",
+                ["de-DE", "de-DE-x-goethe"],
+                [("de-DE", 0.8), ("de-DE-x-goethe", 0.8)],
+            ),
+            # When a range appears more than once, the first is used
+            (
+                "de-*-DE;q=0.5, de-*-DE;q=0.9",
+                ["de-DE"],
+                [("de-DE", 0.5)],
+            ),
+            (
+                "de-*-DE;q=0, de-*-DE;q=0.9",
+                ["de-DE"],
+                [],
+            ),
+        ],
+    )
+    def test_extended_filtering(
+        self, language_ranges, language_tags, expected_returned
+    ):
+        returned = AcceptLanguage.extended_filtering(
+            language_ranges=language_ranges, language_tags=language_tags
+        )
+        assert returned == expected_returned
+
+    @pytest.mark.parametrize(
+        "language_ranges, expected_returned",
+        [
+            ({"de-*-DE": 0.9, "de": 0.5}, [("de-DE", 0.9)]),
+            ([("de-*-DE", 0.9), ("de", 0.5)], [("de-DE", 0.9)]),
+            (["de-*-DE;q=0.9", "de;q=0.5"], [("de-DE", 0.9)]),
+            (AcceptLanguageValidHeader("de-DE, de;q=0.5"), [("de-DE", 1.0)]),
+        ],
+    )
+    def test_extended_filtering__range_input_types(
+        self, language_ranges, expected_returned
+    ):
+        returned = AcceptLanguage.extended_filtering(
+            language_ranges=language_ranges, language_tags=["de-DE", "fr"]
+        )
+        assert returned == expected_returned
+
+    def test_extended_filtering__invalid_ranges(self):
+        with pytest.raises(ValueError):
+            AcceptLanguage.extended_filtering(
+                language_ranges="de-**-DE", language_tags=["de-DE"]
+            )
+
+
 class TestAcceptLanguageValidHeader:
     @pytest.mark.parametrize("header_value", ["", ", da;q=0.2, en-gb;q=0.3 "])
     def test___init___invalid_header(self, header_value):

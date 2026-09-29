@@ -3814,6 +3814,47 @@ def accept_encoding_property():
     return property(fget, fset, fdel, textwrap.dedent(doc))
 
 
+def _extended_range_match(range_subtags, tag_subtags):
+    # RFC 4647, section 3.3.2 "Extended Filtering": compare the subtags of
+    # the range and the tag, in turn. `range_subtags` and `tag_subtags` are
+    # the lowercased subtags of the range and the tag, respectively.
+    if range_subtags[0] != "*" and range_subtags[0] != tag_subtags[0]:
+        return False
+    range_index = 1
+    tag_index = 1
+    while range_index < len(range_subtags):
+        range_subtag = range_subtags[range_index]
+        if range_subtag == "*":
+            # A wildcard in the range matches any single subtag in the tag
+            # at the current position, without consuming a tag subtag here;
+            # non-matching tag subtags are skipped below.
+            range_index += 1
+            continue
+        if tag_index >= len(tag_subtags):
+            return False
+        tag_subtag = tag_subtags[tag_index]
+        if range_subtag == tag_subtag:
+            range_index += 1
+            tag_index += 1
+            continue
+        if len(tag_subtag) == 1:
+            # A singleton (single letter or digit) subtag in the tag, such
+            # as the 'x' that starts a private-use extension, cannot be
+            # skipped over.
+            return False
+        tag_index += 1
+    return True
+
+
+def _extended_range_specificity(range_subtags):
+    # A tuple that orders ranges from most to least specific: more
+    # non-wildcard subtags first, then more subtags overall.
+    return (
+        sum(1 for subtag in range_subtags if subtag != "*"),
+        len(range_subtags),
+    )
+
+
 class AcceptLanguage:
     """
     Represent an ``Accept-Language`` header.
@@ -3834,6 +3875,22 @@ class AcceptLanguage:
     lang_range_n_weight_compiled_re = re.compile(lang_range_n_weight_re)
     accept_language_compiled_re = _list_1_or_more__compiled_re(
         element_re=lang_range_n_weight_re
+    )
+
+    # RFC 4647 Section 2.2 "Extended Language Range":
+    # extended-language-range = (1*8ALPHA / "*")
+    #                           *("-" (1*8alphanum / "*"))
+    extended_lang_range_re = (
+        r"(?:\*|[A-Za-z]{1,8})" r"(?:-" r"(?:[A-Za-z0-9]{1,8}|\*)" r")*"
+    )
+    extended_lang_range_n_weight_re = _item_n_weight_re(
+        item_re=extended_lang_range_re
+    )
+    extended_lang_range_n_weight_compiled_re = re.compile(
+        extended_lang_range_n_weight_re
+    )
+    extended_accept_language_compiled_re = _list_1_or_more__compiled_re(
+        element_re=extended_lang_range_n_weight_re
     )
 
     @classmethod
@@ -3884,6 +3941,218 @@ class AcceptLanguage:
                 yield (lang_range, qvalue)
 
         return generator(value=value)
+
+    @classmethod
+    def parse_extended(cls, value):
+        """
+        Parse a header value containing extended language ranges.
+
+        This is the same as :meth:`AcceptLanguage.parse`, except that the
+        ranges are parsed as extended language ranges, as defined in
+        :rfc:`RFC 4647, section 2.2 <4647#section-2.2>`, where any subtag
+        (including the first) may be the wildcard ``*``. This is useful when
+        a client sends ranges such as ``de-*-DE``, which are not valid in an
+        ``Accept-Language`` header as defined by :rfc:`RFC 7231, section
+        5.3.5 <7231#section-5.3.5>` (which only allows basic language
+        ranges), but which an application may nonetheless wish to honour
+        using Extended Filtering (see
+        :meth:`AcceptLanguage.extended_filtering`).
+
+        :param value: (``str``) header value
+        :return: If `value` is a valid list of extended language ranges with
+                 optional weights, returns an iterator of (language range,
+                 quality value) tuples, as parsed from the value from left to
+                 right.
+        :raises ValueError: if `value` is not a valid list of extended
+                            language ranges
+        """
+        if cls.extended_accept_language_compiled_re.match(value) is None:
+            raise ValueError("Invalid value for extended language ranges.")
+
+        def generator(value):
+            for match in cls.extended_lang_range_n_weight_compiled_re.finditer(value):
+                lang_range = match.group(1)
+                qvalue = match.group(2)
+                qvalue = float(qvalue) if qvalue else 1.0
+                yield (lang_range, qvalue)
+
+        return generator(value=value)
+
+    @classmethod
+    def extended_filtering(cls, language_ranges, language_tags):
+        """
+        Return the tags that match the ranges, using Extended Filtering.
+
+        This is an explicit implementation of the Extended Filtering
+        matching scheme, defined in :rfc:`RFC 4647, section 3.3.2
+        <4647#section-3.3.2>`. It is the entry point to use when the client
+        supplies extended language ranges (where any subtag may be the
+        wildcard ``*``, e.g. ``de-*-DE``), which the simple prefix matching
+        of :meth:`AcceptLanguageValidHeader.basic_filtering` cannot handle.
+        It filters the tags in the `language_tags` argument and returns the
+        ones that match the ranges according to the matching scheme.
+
+        :param language_ranges: the client's language ranges, with optional
+                                qvalues. This may be:
+
+                                * a ``str`` of comma-separated extended
+                                  language ranges with optional weights,
+                                  e.g. ``'de-*-DE;q=0.9, de-DE'``
+                                * a ``dict``, with language ranges as keys
+                                  and qvalues as values
+                                * a ``tuple`` or ``list``, of language range
+                                  ``str``'s or of ``tuple`` or ``list``
+                                  (language range, qvalue) pairs
+                                * an :class:`AcceptLanguageValidHeader`
+                                  instance (whose basic ranges are used)
+
+        :param language_tags: (``iterable``) language tags
+        :return: A list of tuples of the form (language tag, qvalue), in
+                 descending order of qvalue. If two or more tags have the
+                 same qvalue, the tag whose matched range is more specific
+                 (more non-wildcard subtags, then more subtags overall)
+                 comes first. If two or more tags have the same qvalue and
+                 equally specific matched ranges, they are returned in the
+                 same order as in the `language_tags` argument -- so the
+                 server's preference (the order of `language_tags`) only
+                 takes effect when the client weight and the specificity of
+                 the match are the same.
+
+        For each tag in `language_tags`:
+
+        1. If the tag matches a non-``*`` language range with ``q=0``
+           (meaning "not acceptable", see :rfc:`RFC 7231, section 5.3.1
+           <7231#section-5.3.1>`), the tag is filtered out. This applies
+           even if the tag also matches another range with a non-0 qvalue,
+           so overlapping ranges such as ``de-DE, de-*-DE;q=0`` exclude
+           ``de-DE`` (and ``de-Latn-DE`` and ``de-DE-x-goethe``) entirely.
+        2. Otherwise, the tag is matched against the non-``*`` language
+           ranges with non-0 qvalues. A range matches a tag if, comparing
+           subtags case-insensitively and in turn, each subtag of the range
+           either equals the corresponding subtag of the tag or is the
+           wildcard ``*``; non-matching subtags of the tag are skipped,
+           except that a singleton (single letter or digit) subtag of the
+           tag, such as the ``x`` that starts a private-use extension, can
+           never be skipped. If more than one range matches the tag, the
+           match used is the range with the highest qvalue; where qvalues
+           are tied, the most specific range; where specificity is also
+           tied, the range that appears first in `language_ranges`.
+        3. If the tag does not match any of the non-``*`` language ranges,
+           and there is a ``*`` language range, then if the ``*`` language
+           range has ``q=0``, the language tag is filtered out, otherwise
+           the tag is considered a match with the qvalue of the ``*``
+           range.
+
+        (If a range (``*`` or non-``*``) appears more than once, the first
+        occurrence is used for matching, and the others are ignored.)
+
+        Example, with the candidate tags ``de-DE``, ``de-Latn-DE`` and
+        ``de-DE-x-goethe``:
+
+        .. code-block:: python
+
+            >>> tags = ['de-DE', 'de-Latn-DE', 'de-DE-x-goethe']
+            >>> AcceptLanguage.extended_filtering('de-*-DE;q=0.9, de;q=0.5', tags)
+            [('de-DE', 0.9), ('de-Latn-DE', 0.9), ('de-DE-x-goethe', 0.9)]
+            >>> AcceptLanguage.extended_filtering('de-DE, de-*-DE;q=0', tags)
+            []
+            >>> AcceptLanguage.extended_filtering(
+            ...     'de-*-DE, de-Latn-DE;q=0, de-DE-x-goethe;q=0', tags
+            ... )
+            [('de-DE', 1.0)]
+
+        The wildcard subtag in ``de-*-DE`` matches any single subtag (or,
+        with skipping, any sequence of non-singleton subtags), so it matches
+        all three tags; ``de-Latn-DE;q=0`` and ``de-DE-x-goethe;q=0``
+        exclude exactly those tags, leaving only ``de-DE``.
+        """
+        if isinstance(language_ranges, AcceptLanguageValidHeader):
+            parsed_ranges = list(language_ranges.parsed)
+        else:
+            if not isinstance(language_ranges, str):
+                language_ranges = cls._python_value_to_header_str(
+                    value=language_ranges
+                )
+            parsed_ranges = list(cls.parse_extended(value=language_ranges))
+
+        not_acceptable_subtags = []
+        acceptable_ranges = {}
+        seen_ranges = set()
+        asterisk_qvalue = None
+
+        for position, (range_, qvalue) in enumerate(parsed_ranges):
+            range_ = range_.lower()
+            if range_ == "*":
+                if asterisk_qvalue is None:
+                    asterisk_qvalue = qvalue
+            elif range_ not in seen_ranges:
+                # if we have not already encountered this range
+                seen_ranges.add(range_)
+                subtags = range_.split("-")
+                if qvalue == 0.0:
+                    not_acceptable_subtags.append(subtags)
+                else:
+                    acceptable_ranges[range_] = (
+                        subtags,
+                        qvalue,
+                        _extended_range_specificity(subtags),
+                        position,
+                    )
+        acceptable_ranges = sorted(
+            acceptable_ranges.values(), key=lambda tuple_: tuple_[3]
+        )
+        # Sort by specificity, descending
+        acceptable_ranges.sort(key=lambda tuple_: tuple_[2], reverse=True)
+        # Sort by qvalue, descending
+        acceptable_ranges.sort(key=lambda tuple_: tuple_[1], reverse=True)
+        # Sorts are guaranteed to be stable, so for ranges with the same
+        # qvalue, the more specific range comes first, and for ranges with
+        # the same qvalue and specificity, the range that appears first in
+        # `language_ranges` comes first. The first range in this list that
+        # matches a tag is therefore the best match for the tag.
+
+        filtered_tags = []
+        for tag in language_tags:
+            tag_subtags = tag.lower().split("-")
+
+            # If tag matches a non-'*' range with q=0, it is filtered out
+            if any(
+                _extended_range_match(
+                    range_subtags=range_subtags, tag_subtags=tag_subtags
+                )
+                for range_subtags in not_acceptable_subtags
+            ):
+                continue
+
+            matched_qvalue = None
+            for _subtags, qvalue, specificity, _position in acceptable_ranges:
+                if _extended_range_match(
+                    range_subtags=_subtags, tag_subtags=tag_subtags
+                ):
+                    matched_qvalue = qvalue
+                    matched_specificity = specificity
+                    break
+            if matched_qvalue is None:
+                if asterisk_qvalue:
+                    # The '*' range matches only tags not matched by any
+                    # other range. (See the corresponding comment in
+                    # AcceptLanguageValidHeader.basic_filtering.)
+                    matched_qvalue = asterisk_qvalue
+                    matched_specificity = (0, 0)
+            if matched_qvalue is not None:  # if there was a match
+                filtered_tags.append((tag, matched_qvalue, matched_specificity))
+
+        # Sort by matched range specificity, descending
+        filtered_tags.sort(key=lambda tuple_: tuple_[2], reverse=True)
+        # Sort by qvalue, descending
+        filtered_tags.sort(key=lambda tuple_: tuple_[1], reverse=True)
+        # Sorts are stable, so tags with the same qvalue and equally
+        # specific matched ranges remain in the order of the `language_tags`
+        # argument: the server's preference is only a tiebreaker after the
+        # client's weight and the specificity of the match.
+
+        return [(item[0], item[1]) for item in filtered_tags]
+        # (tag, qvalue), dropping the matched range specificity
 
 
 class AcceptLanguageValidHeader(AcceptLanguage):

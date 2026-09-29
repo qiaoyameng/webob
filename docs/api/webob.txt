@@ -81,7 +81,7 @@ methods:
              acceptable_offers, best_match, quality
 
 .. autoclass:: AcceptLanguage
-   :members: parse
+   :members: parse, parse_extended, extended_filtering
 
 .. autoclass:: AcceptLanguageValidHeader
    :members: header_value, parsed, __init__, __add__, __contains__, __iter__,

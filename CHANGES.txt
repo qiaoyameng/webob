@@ -1,6 +1,18 @@
 Unreleased
 ----------
 
+Feature
+~~~~~~~
+
+- Added ``AcceptLanguage.extended_filtering``, an explicit implementation of
+  the Extended Filtering matching scheme from RFC 4647, section 3.3.2, along
+  with ``AcceptLanguage.parse_extended`` for parsing extended language
+  ranges. This supports clients that send extended language ranges such as
+  ``de-*-DE`` (where any subtag may be the wildcard ``*``), which the simple
+  prefix matching of ``AcceptLanguageValidHeader.basic_filtering`` cannot
+  handle. The existing ``basic_filtering`` and ``lookup`` behavior is
+  unchanged.
+
 Security Fix
 ~~~~~~~~~~~~
 
