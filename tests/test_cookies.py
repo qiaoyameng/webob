@@ -840,3 +840,157 @@ class TestSignedSerializer:
         ser = self.makeOne("secret", salt.decode("latin-1"))
 
         assert ser.loads(serialize("secret", salt, "test")) == "test"
+
+
+class TestSetCookiePreserving:
+    def test_round_trip_modern_attributes(self):
+        header = (
+            "session=abc123; Path=/; Expires=Wed, 21 Oct 2026 07:28:00 GMT; "
+            "Secure; HttpOnly; SameSite=None; Partitioned; Priority=High; "
+            'X-Custom=1; Theme="dark mode"'
+        )
+        sc = cookies.parse_set_cookie(header)
+        assert sc.name == "session"
+        assert sc.value == "abc123"
+        assert sc.serialize() == header
+
+    def test_round_trip_quoted_value_with_semicolon(self):
+        header = 'a="b;c"; Path=/; Secure'
+        sc = cookies.parse_set_cookie(header)
+        assert sc.value == '"b;c"'
+        assert sc.serialize() == header
+
+    def test_known_attributes_vs_extensions(self):
+        sc = cookies.parse_set_cookie(
+            "a=1; Path=/; Partitioned; Priority=High; X-Custom=1; SameParty"
+        )
+        assert sc.known_attributes == [
+            ("Path", "/"),
+            ("Partitioned", None),
+            ("Priority", "High"),
+        ]
+        assert sc.extensions == [("X-Custom", "1"), ("SameParty", None)]
+
+    def test_duplicate_attributes_preserved(self):
+        header = "a=1; X-Dup=1; Path=/; X-Dup=2"
+        sc = cookies.parse_set_cookie(header)
+        assert sc.get_all("X-Dup") == ["1", "2"]
+        assert sc.get("x-dup") == "1"
+        assert sc.serialize() == header
+
+    def test_set_appends_missing_attribute(self):
+        header = "session=abc; Path=/; Partitioned; Priority=High"
+        sc = cookies.parse_set_cookie(header)
+        sc.set("Secure")
+        assert sc.serialize() == header + "; Secure"
+
+    def test_set_replaces_existing_attribute_in_place(self):
+        header = "a=1; Path=/; SameSite=Lax; Secure"
+        sc = cookies.parse_set_cookie(header)
+        sc.set("SameSite", "None")
+        assert sc.serialize() == "a=1; Path=/; SameSite=None; Secure"
+
+    def test_set_existing_flag_is_idempotent(self):
+        header = "a=1; Secure; Path=/"
+        sc = cookies.parse_set_cookie(header)
+        sc.set("Secure")
+        assert sc.serialize() == header
+
+    def test_set_collapses_duplicates_in_place(self):
+        sc = cookies.parse_set_cookie("a=1; X-Dup=1; Path=/; X-Dup=2")
+        sc.set("X-Dup", "3")
+        assert sc.serialize() == "a=1; X-Dup=3; Path=/"
+
+    def test_add_allows_duplicates(self):
+        sc = cookies.parse_set_cookie("a=1; X-Dup=1")
+        sc.add("X-Dup", "2")
+        assert sc.serialize() == "a=1; X-Dup=1; X-Dup=2"
+
+    def test_remove_attribute(self):
+        sc = cookies.parse_set_cookie("a=1; Secure; Path=/; Secure")
+        assert sc.remove("secure") == 2
+        assert sc.serialize() == "a=1; Path=/"
+        assert not sc.has("Secure")
+
+    def test_proxy_add_secure_round_trip(self):
+        headers = (
+            "session=abc123; Path=/; Expires=Wed, 21 Oct 2026 07:28:00 GMT; "
+            "HttpOnly; SameSite=None; Partitioned; Priority=High; "
+            'X-Custom=1; Theme="dark mode", '
+            "prefs=compact; Path=/prefs; Priority=Low"
+        )
+        parsed = cookies.parse_set_cookie_list(headers)
+        assert len(parsed) == 2
+        for sc in parsed:
+            sc.set("Secure")
+        out = cookies.serialize_set_cookie_list(parsed)
+        assert out == (
+            "session=abc123; Path=/; Expires=Wed, 21 Oct 2026 07:28:00 GMT; "
+            "HttpOnly; SameSite=None; Partitioned; Priority=High; "
+            'X-Custom=1; Theme="dark mode"; Secure, '
+            "prefs=compact; Path=/prefs; Priority=Low; Secure"
+        )
+
+    def test_expires_comma_is_not_another_cookie(self):
+        parsed = cookies.parse_set_cookie_list(
+            "a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT; Secure, b=2; Path=/"
+        )
+        assert len(parsed) == 2
+        assert parsed[0].get("Expires") == "Wed, 21 Oct 2026 07:28:00 GMT"
+        assert parsed[0].has("Secure")
+        assert parsed[1].name == "b"
+
+    def test_expires_comma_at_end_of_header(self):
+        parsed = cookies.parse_set_cookie_list(
+            "a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT"
+        )
+        assert len(parsed) == 1
+        assert parsed[0].get("Expires") == "Wed, 21 Oct 2026 07:28:00 GMT"
+
+    def test_empty_list(self):
+        assert cookies.parse_set_cookie_list("") == []
+
+    def test_parse_bytes(self):
+        sc = cookies.parse_set_cookie(b"a=1; Secure")
+        assert sc.name == "a"
+        assert sc.serialize() == "a=1; Secure"
+
+    def test_invalid_no_equals(self):
+        with pytest.raises(cookies.SetCookieParseError, match="no '='"):
+            cookies.parse_set_cookie("not-a-cookie")
+
+    def test_invalid_empty_name(self):
+        with pytest.raises(cookies.SetCookieParseError, match="empty cookie name"):
+            cookies.parse_set_cookie("=value")
+
+    def test_invalid_attribute_name(self):
+        with pytest.raises(cookies.SetCookieParseError, match="malformed attribute"):
+            cookies.parse_set_cookie("a=1; =oops")
+
+    def test_invalid_control_characters(self):
+        with pytest.raises(cookies.SetCookieParseError, match="control characters"):
+            cookies.parse_set_cookie("a=1\r\nX-Injected: yes")
+
+    def test_set_rejects_injection(self):
+        sc = cookies.parse_set_cookie("a=1; Path=/")
+        with pytest.raises(ValueError, match="control characters"):
+            sc.set("Path", "/\r\nX-Injected: yes")
+        with pytest.raises(ValueError, match="token"):
+            sc.set("Bad Name", "x")
+
+    def test_serialize_rejects_injection(self):
+        sc = cookies.SetCookie("a", "1")
+        sc.attributes.append(("Path", "/\r\nX-Injected: yes"))
+        with pytest.raises(ValueError, match="control characters"):
+            sc.serialize()
+
+    def test_serialize_rejects_unquoted_semicolon(self):
+        sc = cookies.SetCookie("a", "1")
+        with pytest.raises(ValueError, match="unquoted ';'"):
+            sc.set("X-Custom", "a;b")
+
+    def test_equality(self):
+        assert cookies.parse_set_cookie("a=1; Secure") == cookies.parse_set_cookie(
+            "a=1; Secure"
+        )
+        assert cookies.parse_set_cookie("a=1") != cookies.parse_set_cookie("a=2")

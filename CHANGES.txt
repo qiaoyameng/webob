@@ -47,6 +47,17 @@ Security Fix
 Feature
 ~~~~~~~
 
+- Add ``webob.cookies.SetCookie`` together with ``parse_set_cookie``,
+  ``parse_set_cookie_list`` and ``serialize_set_cookie_list``: a lossless
+  ``Set-Cookie`` parsing and editing API that preserves unknown extension
+  attributes, duplicate attributes and the original attribute order, so
+  intermediaries can amend a header (for example adding ``Secure``) and
+  replay every other attribute verbatim.  The parser handles the comma
+  inside ``Expires`` dates, raises ``SetCookieParseError`` with a specific
+  diagnostic for malformed headers, and refuses to parse or serialize
+  values containing control characters so no injectable header can be
+  produced.
+
 - Rename "master" git branch to "main"
 
 - Add support for Python 3.12.
