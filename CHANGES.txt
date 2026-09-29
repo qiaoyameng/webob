@@ -57,6 +57,18 @@ Feature
 
 - Add Request.remote_host, exposing REMOTE_HOST environment variable.
 
+- Add support for HTTP Structured Fields (RFC 8941) via the new
+  ``webob.structured`` module, providing strict parsing and canonical
+  serialization of Item, List and Dictionary field values (including
+  parameters, inner lists, byte sequences, booleans and fixed-point
+  decimals). ``ResponseHeaders`` and ``EnvironHeaders`` gain
+  ``get_structured(key, field_type)`` and ``set_structured(key, value,
+  field_type)`` methods; repeated header lines are merged according to
+  the declared field type, and malformed values (out-of-range numbers,
+  invalid escapes, duplicate dictionary members, ...) raise
+  ``webob.structured.StructuredFieldError`` instead of being silently
+  discarded.
+
 - Added ``acceptparse.Accept.parse_offer`` to codify what types of offers
   are compatible with ``acceptparse.AcceptValidHeader.acceptable_offers``,
   ``acceptparse.AcceptMissingHeader.acceptable_offers``, and

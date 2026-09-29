@@ -1,0 +1,27 @@
+:mod:`webob.structured` -- HTTP Structured Fields (RFC 8941)
+============================================================
+
+.. automodule:: webob.structured
+
+Typed access is also available directly on header objects via
+``ResponseHeaders.get_structured(name, field_type)`` /
+``ResponseHeaders.set_structured(name, value, field_type)`` (and the
+same methods on ``EnvironHeaders``), where ``field_type`` is one of
+``"item"``, ``"list"`` or ``"dictionary"``.  Repeated field lines are
+merged according to the field type: lists are concatenated, dictionaries
+are merged (duplicate members are an error), and an item field must
+appear on a single line.
+
+.. autoclass:: StructuredFieldError
+.. autoclass:: Token
+.. autoclass:: Parameters
+.. autoclass:: Item
+.. autoclass:: InnerList
+.. autofunction:: parse_item
+.. autofunction:: parse_list
+.. autofunction:: parse_dictionary
+.. autofunction:: parse_field
+.. autofunction:: serialize_item
+.. autofunction:: serialize_list
+.. autofunction:: serialize_dictionary
+.. autofunction:: serialize_field

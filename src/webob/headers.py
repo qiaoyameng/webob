@@ -1,8 +1,19 @@
 from collections.abc import MutableMapping
 
 from webob.multidict import MultiDict
+from webob.structured import parse_field, serialize_field
 
 __all__ = ["ResponseHeaders", "EnvironHeaders"]
+
+
+def _get_structured(lines, key, field_type):
+    if not lines:
+        raise KeyError(key)
+    return parse_field(lines, field_type)
+
+
+def _set_structured(headers, key, value, field_type):
+    headers[key] = serialize_field(value, field_type)
 
 
 class ResponseHeaders(MultiDict):
@@ -99,6 +110,20 @@ class ResponseHeaders(MultiDict):
         else:
             raise KeyError(key)
 
+    def get_structured(self, key, field_type):
+        """Return the header parsed as an RFC 8941 structured field.
+
+        ``field_type`` is one of ``"item"``, ``"list"`` or
+        ``"dictionary"``.  Repeated field lines are merged according to
+        the field type; malformed values raise
+        ``webob.structured.StructuredFieldError``.
+        """
+        return _get_structured(self.getall(key), key, field_type)
+
+    def set_structured(self, key, value, field_type):
+        """Replace the header with the canonical serialization of ``value``."""
+        _set_structured(self, key, value, field_type)
+
 
 key2header = {
     "CONTENT_TYPE": "Content-Type",
@@ -164,3 +189,20 @@ class EnvironHeaders(MutableMapping):
 
     def __iter__(self):
         yield from self.keys()
+
+    def get_structured(self, key, field_type):
+        """Return the header parsed as an RFC 8941 structured field.
+
+        ``field_type`` is one of ``"item"``, ``"list"`` or
+        ``"dictionary"``.  Malformed values raise
+        ``webob.structured.StructuredFieldError``.
+        """
+        try:
+            line = self[key]
+        except KeyError:
+            raise KeyError(key) from None
+        return parse_field([line], field_type)
+
+    def set_structured(self, key, value, field_type):
+        """Replace the header with the canonical serialization of ``value``."""
+        _set_structured(self, key, value, field_type)
