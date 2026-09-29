@@ -46,7 +46,7 @@ except ImportError:
     import json
 
 
-__all__ = ["BaseRequest", "Request"]
+__all__ = ["BaseRequest", "BodyReplayView", "Request"]
 
 
 class _NoDefault:
@@ -255,6 +255,47 @@ class BaseRequest:
             self.make_body_seekable()
 
         return self.body_file_raw
+
+    def body_replay_view(self):
+        """
+        Return a new, independent replay view over the request body.
+
+        Every view has its own cursor and supports ``read``, ``readline``
+        and ``seek`` with regular file object boundary semantics, while the
+        underlying ``wsgi.input`` is consumed at most once and shared by all
+        views created from the same environ. Data is buffered in memory until
+        ``request_body_tempfile_limit`` is exceeded, after which it spills
+        into a temporary file.
+
+        Closing a view never invalidates the other views; the shared storage
+        is only released when the last open view is closed.
+
+        A body of unknown length (no ``Content-Length``) can only be
+        replayed when the server declares input termination semantics via
+        ``wsgi.input_terminated`` (or ``webob.is_body_readable``), otherwise
+        ``ValueError`` is raised.
+        """
+
+        clen = self.content_length
+
+        if clen is None and not self.is_body_readable:
+            raise ValueError(
+                "Cannot replay a request body of unknown length unless the "
+                "server declares input termination (wsgi.input_terminated)."
+            )
+
+        store = self.environ.get("webob._body_replay_store")
+
+        if store is None or store.closed:
+            store = _BodyReplayStore(
+                source=self.body_file_raw,
+                content_length=clen,
+                tempfile_limit=self.request_body_tempfile_limit,
+                make_tempfile=self.make_tempfile,
+            )
+            self.environ["webob._body_replay_store"] = store
+
+        return store.open_view()
 
     url_encoding = environ_getter("webob.url_encoding", "UTF-8")
     scheme = environ_getter("wsgi.url_scheme")
@@ -1644,6 +1685,212 @@ class LimitedLengthFile(io.RawIOBase):
         buff[:sz] = data
 
         return sz
+
+
+class _BodyReplayStore:
+    """
+    Shared storage backing one or more :class:`BodyReplayView` objects.
+
+    The original ``wsgi.input`` is consumed lazily and at most once, no
+    matter how many views read how much data. Buffered data is kept in
+    memory until ``tempfile_limit`` is exceeded, then it spills into a
+    temporary file. The storage is released when the last view is closed.
+    """
+
+    def __init__(self, source, content_length, tempfile_limit, make_tempfile):
+        self._source = source
+        # remaining bytes the server promised; None means read until EOF
+        self._remaining = content_length
+        self._tempfile_limit = tempfile_limit
+        self._make_tempfile = make_tempfile
+        self._storage = io.BytesIO()
+        self._in_tempfile = False
+        self._length = 0
+        self._eof = content_length == 0
+        self._views = 0
+        self.closed = False
+
+    def open_view(self):
+        if self.closed:
+            raise ValueError("Body replay storage has been released.")
+        self._views += 1
+
+        return BodyReplayView(self)
+
+    def _release_view(self):
+        self._views -= 1
+
+        if self._views <= 0:
+            self._views = 0
+            self.closed = True
+            self._storage.close()
+            self._source = None
+
+    def _append(self, data):
+        if (
+            not self._in_tempfile
+            and self._length + len(data) > self._tempfile_limit
+        ):
+            storage = self._make_tempfile()
+            self._storage.seek(0)
+            storage.write(self._storage.read())
+            self._storage.close()
+            self._storage = storage
+            self._in_tempfile = True
+        self._storage.seek(0, io.SEEK_END)
+        self._storage.write(data)
+        self._length += len(data)
+
+    def _fill_to(self, offset):
+        # Buffer data from the source until at least ``offset`` is
+        # available, or until EOF. ``offset=None`` means fill to EOF.
+        while not self._eof and (offset is None or self._length <= offset):
+            if self._remaining is not None:
+                if self._remaining <= 0:
+                    self._eof = True
+                    break
+                want = min(65536, self._remaining)
+            else:
+                want = 65536
+            data = self._source.read(want)
+
+            if not data:
+                if self._remaining:
+                    raise DisconnectionError(
+                        "The client disconnected while sending the body "
+                        "(%d more bytes were expected)" % (self._remaining,)
+                    )
+                self._eof = True
+                break
+            self._append(data)
+
+            if self._remaining is not None:
+                self._remaining -= len(data)
+
+    def _read_at(self, pos, size):
+        if size is None or size < 0:
+            self._fill_to(None)
+            end = self._length
+        else:
+            self._fill_to(pos + size)
+            end = min(pos + size, self._length)
+
+        if pos >= end:
+            return b""
+        self._storage.seek(pos)
+
+        return self._storage.read(end - pos)
+
+    def _readline_at(self, pos, size):
+        if size is not None and size >= 0 and size == 0:
+            return b""
+        limit = None if size is None or size < 0 else pos + size
+        start = pos
+
+        while limit is None or pos < limit:
+            self._fill_to(pos)
+
+            if pos >= self._length:
+                break
+            end = self._length if limit is None else min(self._length, limit)
+            self._storage.seek(pos)
+            chunk = self._storage.read(end - pos)
+            nl = chunk.find(b"\n")
+
+            if nl >= 0:
+                pos += nl + 1
+
+                return self._read_at(start, pos - start)
+            pos += len(chunk)
+
+        return self._read_at(start, pos - start)
+
+
+class BodyReplayView(io.IOBase):
+    """
+    An independent, seekable read-only view over a request body shared
+    through a :class:`_BodyReplayStore`.
+
+    Each view has its own cursor; closing it does not affect any sibling
+    views. Created via :meth:`BaseRequest.body_replay_view`.
+    """
+
+    def __init__(self, store):
+        self._store = store
+        self._pos = 0
+
+    def __repr__(self):
+        return f"<{self.__class__.__name__}(pos={self._pos})>"
+
+    def _check_closed(self):
+        if self.closed:
+            raise ValueError("I/O operation on closed body replay view.")
+
+    @staticmethod
+    def readable():
+        return True
+
+    @staticmethod
+    def seekable():
+        return True
+
+    @staticmethod
+    def writable():
+        return False
+
+    def tell(self):
+        self._check_closed()
+
+        return self._pos
+
+    def read(self, size=-1):
+        self._check_closed()
+
+        if size is not None and size == 0:
+            return b""
+        data = self._store._read_at(self._pos, -1 if size is None else size)
+        self._pos += len(data)
+
+        return data
+
+    def readinto(self, buff):
+        data = self.read(len(buff))
+        buff[: len(data)] = data
+
+        return len(data)
+
+    def readline(self, size=-1):
+        self._check_closed()
+        data = self._store._readline_at(self._pos, -1 if size is None else size)
+        self._pos += len(data)
+
+        return data
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        self._check_closed()
+
+        if whence == io.SEEK_SET:
+            pos = offset
+        elif whence == io.SEEK_CUR:
+            pos = self._pos + offset
+        elif whence == io.SEEK_END:
+            self._store._fill_to(None)
+            pos = self._store._length + offset
+        else:
+            raise ValueError(f"invalid whence ({whence})")
+
+        if pos < 0:
+            raise ValueError(f"negative seek position {pos}")
+        self._pos = pos
+
+        return pos
+
+    def close(self):
+        if not self.closed:
+            store = self._store
+            self._store = None
+            super().close()
+            store._release_view()
 
 
 def _get_multipart_boundary(ctype):
