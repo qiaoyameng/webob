@@ -47,6 +47,18 @@ Security Fix
 Feature
 ~~~~~~~
 
+- Added ``webob.cookies.parse_set_cookie`` and
+  ``webob.cookies.parse_set_cookies``, together with the
+  ``webob.cookies.SetCookie`` and ``webob.cookies.SetCookieAttribute``
+  classes: a lossless parser/editor for ``Set-Cookie`` headers that
+  preserves unknown extension attributes (e.g. ``Partitioned`` or
+  ``Priority``), duplicate attributes, and attribute order, so that proxies
+  can rewrite a single attribute (such as adding ``Secure``) without
+  dropping or reordering anything else. Commas inside ``Expires`` dates are
+  not treated as cookie separators, malformed headers raise
+  ``SetCookieParseError`` with a clear diagnosis, and CR/LF characters are
+  rejected so serialized output can never inject additional headers.
+
 - Rename "master" git branch to "main"
 
 - Add support for Python 3.12.

@@ -840,3 +840,189 @@ class TestSignedSerializer:
         ser = self.makeOne("secret", salt.decode("latin-1"))
 
         assert ser.loads(serialize("secret", salt, "test")) == "test"
+
+
+class TestSetCookie:
+    def test_parse_simple(self):
+        sc = cookies.parse_set_cookie("session=abc; Path=/; HttpOnly")
+        assert sc.name == "session"
+        assert sc.value == "abc"
+        assert [a.name for a in sc.attributes] == ["Path", "HttpOnly"]
+        assert sc.get("path") == "/"
+        assert sc.get("httponly") is None
+        assert sc.has("httponly")
+        assert "httponly" in sc
+        assert sc.serialize() == "session=abc; Path=/; HttpOnly"
+
+    def test_round_trip_preserves_everything(self):
+        header = (
+            'session="quoted; value"; Path=/app; '
+            "Expires=Wed, 21 Oct 2015 07:28:00 GMT; Secure; HttpOnly; "
+            "SameSite=None; Partitioned; Priority=High; "
+            'X-Custom="quoted attr"; Priority=Low'
+        )
+        sc = cookies.parse_set_cookie(header)
+        assert sc.serialize() == header
+        assert sc.value == "quoted; value"
+        assert sc.raw_value == '"quoted; value"'
+        assert [a.name for a in sc.known_attributes] == [
+            "Path",
+            "Expires",
+            "Secure",
+            "HttpOnly",
+            "SameSite",
+        ]
+        assert [a.name for a in sc.extensions] == [
+            "Partitioned",
+            "Priority",
+            "X-Custom",
+            "Priority",
+        ]
+        assert sc.get_all("priority") == ["High", "Low"]
+
+    def test_round_trip_preserves_whitespace_and_case(self):
+        header = "a=1;  PATH=/X ;Secure;X-Weird = some value"
+        sc = cookies.parse_set_cookie(header)
+        assert sc.serialize() == header
+        assert sc.get("path") == "/X"
+        assert sc.get("x-weird") == "some value"
+
+    def test_edit_only_changes_requested_attribute(self):
+        header = (
+            "session=abc; Path=/; Partitioned; Priority=High; "
+            'X-Custom="quoted"; HttpOnly'
+        )
+        sc = cookies.parse_set_cookie(header)
+        sc.set("Secure")
+        assert sc.serialize() == header + "; Secure"
+        sc.set("path", "/api")
+        assert sc.serialize() == (
+            "session=abc; Path=/api; Partitioned; Priority=High; "
+            'X-Custom="quoted"; HttpOnly; Secure'
+        )
+        # the original casing of the edited attribute is preserved
+        sc.set("PATH", "/other")
+        assert "Path=/other" in sc.serialize()
+
+    def test_edit_existing_flag_attribute_in_place(self):
+        sc = cookies.parse_set_cookie("a=1; Secure; Path=/")
+        sc.set("secure")
+        assert sc.serialize() == "a=1; Secure; Path=/"
+
+    def test_remove_attribute(self):
+        sc = cookies.parse_set_cookie("a=1; Priority=High; Secure; Priority=Low")
+        assert sc.remove("priority") == 2
+        assert sc.serialize() == "a=1; Secure"
+        assert sc.remove("missing") == 0
+
+    def test_value_setter_quotes_when_needed(self):
+        sc = cookies.parse_set_cookie("a=1; Path=/")
+        sc.value = "new value"
+        assert sc.value == "new value"
+        assert sc.serialize() == 'a="new value"; Path=/'
+        sc.value = "plain"
+        assert sc.serialize() == "a=plain; Path=/"
+
+    def test_mapping_interface(self):
+        sc = cookies.parse_set_cookie("a=1; Path=/")
+        sc["Secure"] = None
+        assert sc["path"] == "/"
+        assert "secure" in sc
+        del sc["path"]
+        assert sc.serialize() == "a=1; Secure"
+        with pytest.raises(KeyError):
+            sc["path"]
+        with pytest.raises(KeyError):
+            del sc["path"]
+
+    def test_construct_new_cookie(self):
+        sc = cookies.SetCookie("session", "abc123")
+        sc.set("Secure")
+        sc.set("Path", "/")
+        assert sc.serialize() == "session=abc123; Secure; Path=/"
+        assert sc.value == "abc123"
+
+    def test_parse_set_cookies_expires_comma_not_split(self):
+        combined = (
+            "a=1; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/, "
+            "b=2; Secure, "
+            'c="x,y"; Priority=High'
+        )
+        result = cookies.parse_set_cookies(combined)
+        assert [sc.name for sc in result] == ["a", "b", "c"]
+        assert result[0].get("expires") == "Wed, 21 Oct 2015 07:28:00 GMT"
+        assert (
+            result[0].serialize() == "a=1; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/"
+        )
+        assert result[1].serialize() == "b=2; Secure"
+        assert result[2].value == "x,y"
+        assert result[2].serialize() == 'c="x,y"; Priority=High'
+
+    def test_parse_set_cookies_single_header(self):
+        result = cookies.parse_set_cookies("a=1; Secure")
+        assert len(result) == 1
+        assert result[0].serialize() == "a=1; Secure"
+
+    def test_parse_set_cookies_bytes_input(self):
+        result = cookies.parse_set_cookies(b"a=1; Secure, b=2")
+        assert [sc.name for sc in result] == ["a", "b"]
+
+    def test_parse_invalid_missing_pair(self):
+        with pytest.raises(cookies.SetCookieParseError):
+            cookies.parse_set_cookie("Secure")
+
+    def test_parse_invalid_empty_name(self):
+        with pytest.raises(cookies.SetCookieParseError):
+            cookies.parse_set_cookie("=value")
+
+    def test_parse_invalid_name_characters(self):
+        with pytest.raises(cookies.SetCookieParseError):
+            cookies.parse_set_cookie("bad name=value")
+
+    def test_parse_invalid_attribute_name(self):
+        with pytest.raises(cookies.SetCookieParseError):
+            cookies.parse_set_cookie("a=1; bad attr=x")
+
+    def test_parse_invalid_unterminated_quote(self):
+        with pytest.raises(cookies.SetCookieParseError):
+            cookies.parse_set_cookie('a="unterminated; Path=/')
+
+    def test_parse_rejects_crlf(self):
+        with pytest.raises(cookies.SetCookieParseError):
+            cookies.parse_set_cookie("a=1\r\nX-Injected: yes")
+        with pytest.raises(cookies.SetCookieParseError):
+            cookies.parse_set_cookies("a=1\nb=2")
+
+    def test_parse_error_is_value_error(self):
+        with pytest.raises(ValueError):
+            cookies.parse_set_cookie("bogus")
+
+    def test_edit_rejects_injection(self):
+        sc = cookies.parse_set_cookie("a=1; Path=/")
+        with pytest.raises(ValueError):
+            sc.set("X\r\nInjected", "1")
+        with pytest.raises(ValueError):
+            sc.set("X-Custom", "1\r\nInjected: yes")
+        with pytest.raises(ValueError):
+            sc.set("X-Custom", "a;b")
+        with pytest.raises(ValueError):
+            sc.value = "1\r\nInjected: yes"
+        with pytest.raises(ValueError):
+            cookies.SetCookie("bad\r\nname", "v")
+        with pytest.raises(ValueError):
+            cookies.SetCookie("bad name", "v")
+        # failed edits must not mutate the cookie
+        assert sc.serialize() == "a=1; Path=/"
+
+    def test_proxy_add_secure_scenario(self):
+        headers = [
+            'session="quoted; value"; Path=/app; Partitioned; Priority=High',
+            "prefs=dark; Expires=Wed, 21 Oct 2015 07:28:00 GMT; HttpOnly; "
+            "X-Custom=keep-me; SameSite=Lax",
+        ]
+        combined = ", ".join(headers)
+        rewritten = []
+        for sc in cookies.parse_set_cookies(combined):
+            sc.set("Secure")
+            rewritten.append(sc.serialize())
+        assert rewritten == [h + "; Secure" for h in headers]

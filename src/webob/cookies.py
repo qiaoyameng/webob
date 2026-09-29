@@ -21,6 +21,11 @@ __all__ = [
     "JSONSerializer",
     "Base64Serializer",
     "make_cookie",
+    "SetCookie",
+    "SetCookieAttribute",
+    "SetCookieParseError",
+    "parse_set_cookie",
+    "parse_set_cookies",
 ]
 
 _marker = object()
@@ -494,6 +499,497 @@ _c_renames = {
 _c_valkeys = sorted(_c_renames)
 _c_keys = set(_c_renames)
 _c_keys.update([b"expires", b"secure", b"httponly", b"samesite"])
+
+
+#
+# Lossless Set-Cookie parsing and editing
+#
+
+# Attributes defined by RFC 6265, plus "comment" from RFC 2965 which WebOb
+# has historically supported. Anything else (e.g. "Partitioned", "Priority",
+# or site-specific attributes) is treated as an unknown extension.
+_KNOWN_SET_COOKIE_ATTRIBUTES = frozenset(
+    [
+        "comment",
+        "domain",
+        "expires",
+        "httponly",
+        "max-age",
+        "path",
+        "samesite",
+        "secure",
+    ]
+)
+
+
+class SetCookieParseError(ValueError):
+    """Raised when a Set-Cookie header cannot be parsed safely."""
+
+
+def _check_set_cookie_token(name, what, header):
+    if not name:
+        raise SetCookieParseError(
+            "Invalid Set-Cookie header, %s is empty: %r" % (what, header)
+        )
+
+    if any(c not in _valid_token_chars for c in name):
+        raise SetCookieParseError(
+            "Invalid Set-Cookie header, %s %r contains invalid "
+            "characters: %r" % (what, name, header)
+        )
+
+    return name
+
+
+def _reject_ctl_chars(value, what):
+    for c in value:
+        if ord(c) < 0x20 or ord(c) == 0x7F:
+            raise ValueError(
+                "%s contains a forbidden control character (%r), refusing "
+                "to create a header that could be used for response "
+                "splitting" % (what, c)
+            )
+
+
+def _validate_new_attribute_name(name):
+    if not isinstance(name, str):
+        raise TypeError("attribute name must be a string, not %r" % type(name))
+
+    _reject_ctl_chars(name, "attribute name")
+
+    if not name or any(c not in _valid_token_chars for c in name):
+        raise ValueError(
+            "Invalid attribute name %r, must be a non-empty RFC 2616 token" % (name,)
+        )
+
+    return name
+
+
+def _validate_new_attribute_value(value):
+    if not isinstance(value, str):
+        raise TypeError("attribute value must be a string, not %r" % type(value))
+
+    _reject_ctl_chars(value, "attribute value")
+
+    if ";" in value:
+        raise ValueError(
+            "attribute value %r contains ';', which would break the "
+            "structure of the header" % (value,)
+        )
+
+    return value
+
+
+def _quote_set_cookie_value(value):
+    if isinstance(value, str):
+        _reject_ctl_chars(value, "cookie value")
+        value = value.encode("utf-8")
+    elif isinstance(value, (bytes, bytearray)):
+        value = bytes(value)
+        if b"\r" in value or b"\n" in value or b"\x00" in value:
+            raise ValueError(
+                "cookie value contains a forbidden control character, "
+                "refusing to create a header that could be used for "
+                "response splitting"
+            )
+    else:
+        raise TypeError("cookie value must be a string, not %r" % type(value))
+
+    if not value.translate(None, _allowed_cookie_bytes):
+        return value.decode("latin-1")
+
+    return (b'"' + b"".join(map(_escape_char, value)) + b'"').decode("latin-1")
+
+
+class SetCookieAttribute:
+    """
+    A single attribute of a ``Set-Cookie`` header.
+
+    ``name`` is the attribute name with its original casing preserved, and
+    ``value`` is the attribute value, or ``None`` for flag attributes such
+    as ``Secure`` or ``Partitioned``.
+
+    Attributes that are not recognized (see :attr:`known`) keep their
+    original text so they round-trip byte-for-byte.
+    """
+
+    __slots__ = ("name", "value", "_raw")
+
+    def __init__(self, name, value=None, raw=None):
+        self.name = name
+        self.value = value
+        self._raw = raw
+
+    @property
+    def known(self):
+        """Whether this attribute is defined by RFC 6265/2965."""
+
+        return self.name.lower() in _KNOWN_SET_COOKIE_ATTRIBUTES
+
+    def serialize(self):
+        if self._raw is not None:
+            return self._raw
+
+        if self.value is None:
+            return "; " + self.name
+
+        return "; {}={}".format(self.name, self.value)
+
+    def __repr__(self):
+        if self.value is None:
+            return "<{}: {}>".format(self.__class__.__name__, self.name)
+
+        return "<{}: {}={!r}>".format(self.__class__.__name__, self.name, self.value)
+
+
+class SetCookie:
+    """
+    A parsed ``Set-Cookie`` header that can be edited losslessly.
+
+    Unlike :class:`Morsel`, this class keeps every attribute of the
+    original header, in order, including unknown extension attributes
+    (``Partitioned``, ``Priority``, custom attributes, ...) and duplicate
+    attributes. Serializing a :class:`SetCookie` reproduces the original
+    header byte-for-byte except for the attributes that were explicitly
+    modified, which makes it suitable for proxies that need to rewrite a
+    single attribute (for example adding ``Secure``) without dropping
+    anything else.
+
+    Use :func:`parse_set_cookie` or :func:`parse_set_cookies` to parse
+    existing headers, or construct a new cookie directly:
+
+    .. code::
+
+        sc = SetCookie("session", "abc123")
+        sc.set("Secure")
+        sc.set("Path", "/")
+        sc.serialize()  # 'session=abc123; Secure; Path=/'
+    """
+
+    def __init__(self, name, value, attributes=()):
+        if not isinstance(name, str):
+            raise TypeError("cookie name must be a string, not %r" % type(name))
+
+        _reject_ctl_chars(name, "cookie name")
+
+        if not name or any(c not in _valid_token_chars for c in name):
+            raise ValueError(
+                "Invalid cookie name %r, must be a non-empty RFC 2616 token" % (name,)
+            )
+
+        self.name = name
+        self._raw_value = ""
+        self._raw_pair = None
+        self._attributes = list(attributes)
+        self.value = value
+
+    @classmethod
+    def _from_parsed(cls, name, raw_value, attributes, raw_pair):
+        obj = cls.__new__(cls)
+        obj.name = name
+        obj._raw_value = raw_value
+        obj._raw_pair = raw_pair
+        obj._attributes = list(attributes)
+
+        return obj
+
+    @property
+    def value(self):
+        """The cookie value, unquoted and unescaped."""
+
+        raw = self._raw_value.encode("latin-1")
+
+        return _unquote(raw).decode("utf-8", "surrogateescape")
+
+    @value.setter
+    def value(self, value):
+        raw_value = _quote_set_cookie_value(value)
+        self._raw_value = raw_value
+        self._raw_pair = None
+
+    @property
+    def raw_value(self):
+        """The cookie value exactly as it appears on the wire."""
+
+        return self._raw_value
+
+    @property
+    def attributes(self):
+        """All attributes, in order, including duplicates."""
+
+        return tuple(self._attributes)
+
+    @property
+    def known_attributes(self):
+        """Attributes defined by RFC 6265/2965, in order."""
+
+        return tuple(a for a in self._attributes if a.known)
+
+    @property
+    def extensions(self):
+        """Unknown extension attributes, in order."""
+
+        return tuple(a for a in self._attributes if not a.known)
+
+    def get_all(self, name):
+        """Return the values of every attribute named ``name``, in order."""
+
+        lname = name.lower()
+
+        return [a.value for a in self._attributes if a.name.lower() == lname]
+
+    def get(self, name, default=None):
+        """Return the value of the first attribute named ``name``."""
+
+        values = self.get_all(name)
+
+        return values[0] if values else default
+
+    def has(self, name):
+        """Whether an attribute named ``name`` is present."""
+
+        lname = name.lower()
+
+        return any(a.name.lower() == lname for a in self._attributes)
+
+    __contains__ = has
+
+    def set(self, name, value=None):
+        """
+        Set the attribute ``name`` to ``value``.
+
+        ``value`` may be ``None`` for flag attributes such as ``Secure``.
+        If the attribute already exists, only the first occurrence is
+        updated, in place; every other attribute keeps its original
+        position and text. Otherwise the new attribute is appended.
+        """
+
+        name = _validate_new_attribute_name(name)
+
+        if value is not None:
+            value = _validate_new_attribute_value(value)
+
+        lname = name.lower()
+
+        for attr in self._attributes:
+            if attr.name.lower() == lname:
+                attr.value = value
+                attr._raw = None
+
+                return
+
+        self._attributes.append(SetCookieAttribute(name, value))
+
+    def remove(self, name):
+        """Remove all attributes named ``name``; returns the count removed."""
+
+        lname = name.lower()
+        kept = [a for a in self._attributes if a.name.lower() != lname]
+        removed = len(self._attributes) - len(kept)
+        self._attributes[:] = kept
+
+        return removed
+
+    def __getitem__(self, name):
+        values = self.get_all(name)
+
+        if not values:
+            raise KeyError(name)
+
+        return values[0]
+
+    def __setitem__(self, name, value):
+        self.set(name, value)
+
+    def __delitem__(self, name):
+        if not self.remove(name):
+            raise KeyError(name)
+
+    def serialize(self):
+        if self._raw_pair is not None:
+            pair = self._raw_pair
+        else:
+            pair = "{}={}".format(self.name, self._raw_value)
+
+        result = pair + "".join(a.serialize() for a in self._attributes)
+
+        if "\r" in result or "\n" in result:
+            raise ValueError(
+                "refusing to serialize a Set-Cookie header containing "
+                "CR/LF characters"
+            )
+
+        return result
+
+    __str__ = serialize
+
+    def __repr__(self):
+        return "<{}: {}={!r}>".format(self.__class__.__name__, self.name, self.value)
+
+
+def _split_cookie_segments(header):
+    # Split a single Set-Cookie header on ';', ignoring semicolons inside
+    # double-quoted strings.
+    segments = []
+    start = 0
+    in_quotes = False
+    i = 0
+    length = len(header)
+
+    while i < length:
+        c = header[i]
+
+        if c == "\\" and in_quotes:
+            i += 2
+            continue
+
+        if c == '"':
+            in_quotes = not in_quotes
+        elif c == ";" and not in_quotes:
+            segments.append(header[start:i])
+            start = i + 1
+
+        i += 1
+
+    if in_quotes:
+        raise SetCookieParseError(
+            "Invalid Set-Cookie header, unterminated quoted string: %r" % (header,)
+        )
+
+    segments.append(header[start:])
+
+    return segments
+
+
+def _split_set_cookie_header(header):
+    # Split a combined Set-Cookie header into individual cookies. A comma
+    # only starts a new cookie when it is followed by a token and an '='
+    # before any ';', so the comma inside an Expires date (e.g.
+    # "Expires=Wed, 21 Oct 2015 07:28:00 GMT") is not treated as a cookie
+    # separator.
+    parts = []
+    start = 0
+    in_quotes = False
+    i = 0
+    length = len(header)
+
+    while i < length:
+        c = header[i]
+
+        if c == "\\" and in_quotes:
+            i += 2
+            continue
+
+        if c == '"':
+            in_quotes = not in_quotes
+        elif c == "," and not in_quotes:
+            j = i + 1
+
+            while j < length and header[j] in " \t":
+                j += 1
+
+            k = j
+
+            while k < length and header[k] in _valid_token_chars:
+                k += 1
+
+            if k > j and k < length and header[k] == "=":
+                parts.append(header[start:i])
+                start = i + 1
+
+        i += 1
+
+    parts.append(header[start:])
+
+    return [p.strip(" \t") for p in parts if p.strip(" \t")]
+
+
+def parse_set_cookie(header):
+    """
+    Parse a single ``Set-Cookie`` header value into a :class:`SetCookie`.
+
+    The result preserves the cookie value, all known attributes, unknown
+    extension attributes, and duplicate attributes, in their original
+    order, so that ``parse_set_cookie(h).serialize() == h`` for any
+    well-formed header ``h``.
+
+    Raises :exc:`SetCookieParseError` with a description of the problem
+    when the header is malformed, and refuses headers containing CR/LF
+    characters so a parsed header can never be used for response
+    splitting.
+    """
+
+    if isinstance(header, (bytes, bytearray)):
+        header = bytes(header).decode("latin-1")
+
+    if not isinstance(header, str):
+        raise TypeError("header must be a string, not %r" % type(header))
+
+    if "\r" in header or "\n" in header:
+        raise SetCookieParseError(
+            "Invalid Set-Cookie header, contains CR/LF characters, "
+            "refusing to parse a potentially injected header: %r" % (header,)
+        )
+
+    header = header.strip(" \t")
+    segments = _split_cookie_segments(header)
+    pair = segments[0]
+    name, sep, raw_value = pair.partition("=")
+
+    if not sep:
+        raise SetCookieParseError(
+            "Invalid Set-Cookie header, expected a name=value pair: %r" % (header,)
+        )
+
+    name = _check_set_cookie_token(name.strip(" \t"), "cookie name", header)
+    raw_value = raw_value.strip(" \t")
+    attributes = []
+
+    for segment in segments[1:]:
+        stripped = segment.strip(" \t")
+
+        if not stripped:
+            # Tolerate empty segments, e.g. a trailing ';'
+            continue
+
+        attr_name, sep, attr_value = stripped.partition("=")
+        attr_name = _check_set_cookie_token(
+            attr_name.strip(" \t"), "attribute name", header
+        )
+        attributes.append(
+            SetCookieAttribute(
+                attr_name,
+                attr_value.strip(" \t") if sep else None,
+                raw=";" + segment,
+            )
+        )
+
+    return SetCookie._from_parsed(name, raw_value, attributes, raw_pair=pair)
+
+
+def parse_set_cookies(header):
+    """
+    Parse a possibly combined ``Set-Cookie`` header into a list of
+    :class:`SetCookie`.
+
+    Commas inside ``Expires`` dates and quoted values are not treated as
+    cookie separators. Raises :exc:`SetCookieParseError` for malformed
+    input.
+    """
+
+    if isinstance(header, (bytes, bytearray)):
+        header = bytes(header).decode("latin-1")
+
+    if not isinstance(header, str):
+        raise TypeError("header must be a string, not %r" % type(header))
+
+    if "\r" in header or "\n" in header:
+        raise SetCookieParseError(
+            "Invalid Set-Cookie header, contains CR/LF characters, "
+            "refusing to parse a potentially injected header: %r" % (header,)
+        )
+
+    return [parse_set_cookie(part) for part in _split_set_cookie_header(header)]
 
 
 def make_cookie(

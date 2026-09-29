@@ -14,3 +14,14 @@ Cookies
    :members:
 .. autofunction:: webob.cookies.make_cookie
 
+Lossless Set-Cookie parsing and editing
+---------------------------------------
+
+.. autoclass:: webob.cookies.SetCookie
+   :members:
+.. autoclass:: webob.cookies.SetCookieAttribute
+   :members:
+.. autoclass:: webob.cookies.SetCookieParseError
+   :members:
+.. autofunction:: webob.cookies.parse_set_cookie
+.. autofunction:: webob.cookies.parse_set_cookies
