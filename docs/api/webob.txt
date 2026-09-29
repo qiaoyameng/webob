@@ -85,17 +85,20 @@ methods:
 
 .. autoclass:: AcceptLanguageValidHeader
    :members: header_value, parsed, __init__, __add__, __contains__, __iter__,
-	     __radd__, __str__, parse, basic_filtering, best_match, lookup,
+	     __radd__, __str__, parse, basic_filtering, extended_filtering,
+             best_match, lookup,
              quality
 
 .. autoclass:: AcceptLanguageNoHeader
    :members: header_value, parsed, __init__, __add__, __contains__, __iter__,
-	     __radd__, __str__, parse, basic_filtering, best_match, lookup,
+	     __radd__, __str__, parse, basic_filtering, extended_filtering,
+             best_match, lookup,
              quality
 
 .. autoclass:: AcceptLanguageInvalidHeader
    :members: header_value, parsed, __init__, __add__, __contains__, __iter__,
-	     __radd__, __str__, parse, basic_filtering, best_match, lookup,
+	     __radd__, __str__, parse, basic_filtering, extended_filtering,
+             best_match, lookup,
              quality
 
 Deprecated:

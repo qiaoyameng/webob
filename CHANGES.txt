@@ -47,6 +47,13 @@ Security Fix
 Feature
 ~~~~~~~
 
+- Add ``AcceptLanguageValidHeader.extended_filtering``, an implementation of
+  the Extended Filtering matching scheme from RFC 4647, section 3.3.2. The
+  ``Accept-Language`` header now also accepts extended language ranges
+  (RFC 4647, section 2.2, e.g. ``de-*-DE``), which clients do send in the
+  header. Existing ``basic_filtering`` and ``lookup`` behaviour is
+  unchanged.
+
 - Rename "master" git branch to "main"
 
 - Add support for Python 3.12.

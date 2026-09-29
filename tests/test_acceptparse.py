@@ -4365,8 +4365,6 @@ class TestAcceptLanguage:
         [
             "",
             "*s",
-            "*-a",
-            "a-*",
             "a" * 9,
             "a-" + "a" * 9,
             "a-a-" + "a" * 9,
@@ -4392,6 +4390,13 @@ class TestAcceptLanguage:
         [
             ("*", [("*", 1.0)]),
             ("fR;q=0.5", [("fR", 0.5)]),
+            # Extended language ranges (RFC 4647, section 2.2)
+            ("de-*-DE", [("de-*-DE", 1.0)]),
+            ("*-DE", [("*-DE", 1.0)]),
+            ("de-*-DE;q=0.5", [("de-*-DE", 0.5)]),
+            ("a-*", [("a-*", 1.0)]),
+            ("*-a", [("*-a", 1.0)]),
+            ("de-*-Latn-*-DE", [("de-*-Latn-*-DE", 1.0)]),
             ("zh-Hant;q=0.500", [("zh-Hant", 0.5)]),
             ("zh-Hans-CN;q=1", [("zh-Hans-CN", 1.0)]),
             ("de-CH-x-phonebk;q=1.0", [("de-CH-x-phonebk", 1.0)]),
@@ -4808,6 +4813,143 @@ class TestAcceptLanguageValidHeader:
     def test_basic_filtering(self, header_value, language_tags, expected_returned):
         instance = AcceptLanguageValidHeader(header_value=header_value)
         returned = instance.basic_filtering(language_tags=language_tags)
+        assert returned == expected_returned
+
+    @pytest.mark.parametrize(
+        "header_value, language_tags, expected_returned",
+        [
+            # Empty `language_tags`
+            ("de-*-DE", [], []),
+            # No matches
+            ("de-*-DE", ["de-CH", "en-DE"], []),
+            # An extended range with a '*' subtag: 'de-*-DE' matches tags
+            # with a 'de' first subtag and a later 'DE' subtag
+            (
+                "de-*-DE",
+                ["de-DE", "de-Latn-DE", "de-DE-x-goethe", "de-CH"],
+                [("de-DE", 1.0), ("de-Latn-DE", 1.0), ("de-DE-x-goethe", 1.0)],
+            ),
+            # Matching is case-insensitive, in both the range and the tags
+            (
+                "DE-*-de",
+                ["dE-latn-De", "de-ch"],
+                [("dE-latn-De", 1.0)],
+            ),
+            # A '*' subtag in the range matches any subtag, so 'de-*-DE'
+            # also matches 'de-DE' where there is no subtag for '*' to match
+            ("de-*-DE", ["de-DE"], [("de-DE", 1.0)]),
+            # Non-'*' range subtags may skip over non-singleton tag subtags:
+            # 'de-DE' as an extended range matches 'de-Latn-DE'
+            ("de-DE", ["de-Latn-DE", "de-CH"], [("de-Latn-DE", 1.0)]),
+            # A singleton subtag in a tag cannot be skipped over: the 'x' in
+            # 'de-DE-x-goethe' means 'de-DE-goethe' does not match it
+            (
+                "de-DE-goethe",
+                ["de-DE-x-goethe", "de-DE-goethe"],
+                [("de-DE-goethe", 1.0)],
+            ),
+            # ...but a singleton in the tag matches an identical singleton in
+            # the range
+            ("de-DE-x-goethe", ["de-DE-x-goethe"], [("de-DE-x-goethe", 1.0)]),
+            # '*' as the first subtag of a range matches any first subtag
+            (
+                "*-DE",
+                ["de-DE", "en-DE", "de-CH"],
+                [("de-DE", 1.0), ("en-DE", 1.0)],
+            ),
+            # If a tag matches a non-'*' range with q=0, tag is filtered out
+            (
+                "de, de-*-DE;q=0",
+                ["de-DE", "de-Latn-DE", "de-CH", "de"],
+                [("de-CH", 1.0), ("de", 1.0)],
+            ),
+            # Overlapping q=0 ranges: 'de-DE-x-goethe' matches both
+            # 'de-*-DE;q=0' and 'de-DE-x-goethe;q=0', and is filtered out
+            # even though it also matches 'de'
+            (
+                "de, de-*-DE;q=0, de-DE-x-goethe;q=0",
+                ["de-DE", "de-Latn-DE", "de-DE-x-goethe", "de-CH", "de"],
+                [("de-CH", 1.0), ("de", 1.0)],
+            ),
+            # A tag matching a q=0 range is filtered out even if it also
+            # matches another range with a non-0 qvalue
+            (
+                "de-DE, de-*-DE;q=0",
+                ["de-DE", "de-Latn-DE"],
+                [],
+            ),
+            # '*' range matches only tags not matched by any other range
+            (
+                "de-Latn-DE;q=0.5, *;q=0.2",
+                ["de-Latn-DE", "de-DE", "en"],
+                [("de-Latn-DE", 0.5), ("de-DE", 0.2), ("en", 0.2)],
+            ),
+            # '*' range with q=0 filters out tags not matched by other ranges
+            (
+                "de-Latn-DE, *;q=0",
+                ["de-Latn-DE", "de-DE"],
+                [("de-Latn-DE", 1.0)],
+            ),
+            # More than one range matching the same tag: range with the
+            # highest qvalue is matched
+            (
+                "de-*-DE;q=0.7, de-DE;q=0.9",
+                ["de-DE"],
+                [("de-DE", 0.9)],
+            ),
+            # When qvalues are tied, the tag whose best matching range is
+            # more specific comes first: 'de-DE-x-goethe' matches
+            # 'de-DE-x-goethe' while 'de-DE' only matches 'de-*-DE'
+            (
+                "de-Latn-DE;q=0.9, de-DE-x-goethe;q=0.8, de-*-DE;q=0.8",
+                ["de-DE", "de-DE-x-goethe", "de-Latn-DE"],
+                [("de-Latn-DE", 0.9), ("de-DE-x-goethe", 0.8), ("de-DE", 0.8)],
+            ),
+            # Specificity decides the order before server-side preference:
+            # 'de-DE' comes first in `language_tags`, but 'de-DE-x-goethe'
+            # matches the more specific range
+            (
+                "de-DE-x-goethe;q=0.8, de-*-DE;q=0.8",
+                ["de-DE", "de-DE-x-goethe"],
+                [("de-DE-x-goethe", 0.8), ("de-DE", 0.8)],
+            ),
+            # Server-side preference (order of `language_tags`) only decides
+            # the order when qvalue and specificity are equal
+            (
+                "de-*-DE",
+                ["de-DE-x-goethe", "de-Latn-DE", "de-DE"],
+                [("de-DE-x-goethe", 1.0), ("de-Latn-DE", 1.0), ("de-DE", 1.0)],
+            ),
+            # When a non-'*' range appears in the header more than once, we
+            # use the first one for matching and ignore the others
+            (
+                "de-*-DE;q=0.5, de-*-DE;q=0.9",
+                ["de-DE"],
+                [("de-DE", 0.5)],
+            ),
+            (
+                "de-*-DE;q=0, de-*-DE;q=0.9",
+                ["de-DE"],
+                [],
+            ),
+            # The returned list of tuples is sorted in descending order of
+            # qvalue
+            (
+                "de-CH, de-DE-x-goethe;q=0.7, de-Latn-DE;q=0.3",
+                ["de-Latn-DE", "de-DE-x-goethe", "de-CH"],
+                [
+                    ("de-CH", 1.0),
+                    ("de-DE-x-goethe", 0.7),
+                    ("de-Latn-DE", 0.3),
+                ],
+            ),
+        ],
+    )
+    def test_extended_filtering(
+        self, header_value, language_tags, expected_returned
+    ):
+        instance = AcceptLanguageValidHeader(header_value=header_value)
+        returned = instance.extended_filtering(language_tags=language_tags)
         assert returned == expected_returned
 
     @pytest.mark.parametrize(
@@ -5410,6 +5552,11 @@ class TestAcceptLanguageNoHeader:
         returned = instance.basic_filtering(language_tags=["tag1", "tag2"])
         assert returned == []
 
+    def test_extended_filtering(self):
+        instance = AcceptLanguageNoHeader()
+        returned = instance.extended_filtering(language_tags=["tag1", "tag2"])
+        assert returned == []
+
     @pytest.mark.parametrize(
         "offers, default_match, expected_returned",
         [
@@ -5586,6 +5733,11 @@ class TestAcceptLanguageInvalidHeader:
     def test_basic_filtering(self):
         instance = AcceptLanguageInvalidHeader(header_value="")
         returned = instance.basic_filtering(language_tags=["tag1", "tag2"])
+        assert returned == []
+
+    def test_extended_filtering(self):
+        instance = AcceptLanguageInvalidHeader(header_value="")
+        returned = instance.extended_filtering(language_tags=["tag1", "tag2"])
         assert returned == []
 
     @pytest.mark.parametrize(
